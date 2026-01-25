@@ -85,46 +85,73 @@ runs:
           exit 1
         fi
 
-    # Send triggers to diff action, but only for pull requests
+    # Send triggers to diff action (only for pull requests; omitted for push events so tests always run)
     - id: diff
-      uses: bcgov/action-diff-triggers@0d193029efd26c76aeacaa84aba3328de8198370 # v0.2.0
+      uses: bcgov/action-diff-triggers@a4753d53614cac4eb417cd35b05e0e401a76fc9d # v1.0.0
       with:
         triggers: ${{ github.event_name == 'pull_request' && inputs.triggers || '' }}
-        diff_branch: ${{ inputs.diff_branch }}
+        ref: ${{ inputs.diff_branch }}
 
-    # If triggered and (dep or supply) enabled: prepare tools first
-    # Checkout action repository for dependencies
-    - name: Checkout action repository for dependencies
-      if: steps.diff.outputs.triggered == 'true' && ((inputs.supply_scan != 'false') || inputs.dep_scan != 'off')
-      uses: actions/checkout@v6
+    # Get action repository and ref from environment variables with fallbacks
+    - name: Get action repo and ref
+      if: steps.diff.outputs.triggered == 'true'
+      id: action_repo
+      shell: bash
+      run: |
+        ACTION_REF="${GITHUB_ACTION_REF:-${{ github.action_ref }}}"
+
+        # If still empty, extract from action_path (e.g., _actions/bcgov/action-test-and-analyse/temporary-branch/...)
+        if [ -z "$ACTION_REF" ]; then
+          if [[ "${{ github.action_path }}" =~ _actions/[^/]+/[^/]+/(.+) ]]; then
+            ACTION_REF="${BASH_REMATCH[1]}"
+          else
+            echo "::error::Could not determine action ref. action_path: ${{ github.action_path }}"
+            exit 1
+          fi
+        fi
+
+        echo "ref=$ACTION_REF" >> $GITHUB_OUTPUT
+        echo "Using ref: $ACTION_REF"
+
+    # Checkout the action (upstream) repo
+    - uses: actions/checkout@v6
+      if: steps.diff.outputs.triggered == 'true'
       with:
         repository: bcgov/action-test-and-analyse
+        ref: ${{ steps.action_repo.outputs.ref }}
+
+    - if: steps.diff.outputs.triggered == 'true'
+      id: versions
+      shell: bash
+      run: |
+        # Get Action Node Version
+        set -e
+
+        NODE_VER=$(grep -o '"node":\s*"[^"]*"' package.json | grep -o '"[^"]*"' | tail -1 | sed 's/[">=]//g' | cut -d. -f1)
+        echo "action_node_version=$NODE_VER" >> $GITHUB_OUTPUT
 
     # Setup node version (for tool installation, no cache yet - file doesn't exist)
     - uses: actions/setup-node@v6
       if: steps.diff.outputs.triggered == 'true'
       with:
-        node-version: ${{ inputs.node_version }}
+        node-version: ${{ steps.versions.outputs.action_node_version }}
 
-    - if: steps.diff.outputs.triggered == 'true' && ((inputs.supply_scan != 'false') || inputs.dep_scan != 'off')
-      shell: bash
+    - shell: bash
+      if: steps.diff.outputs.triggered == 'true'
       run: |
-        # Setup safe-chain and/or knip
+        # Install dependencies and files
         set -e
 
-        # Install and initialize safe-chain
-        if [ "${{ inputs.supply_scan }}" != "false" ]; then
-          SAFE_CHAIN_VERSION=$(jq -er '.dependencies["@aikidosec/safe-chain"]' package.json)
-          npm install -g "@aikidosec/safe-chain@$SAFE_CHAIN_VERSION"
-          safe-chain setup-ci
-        fi
+        # Safe-chain
+        SAFE_VER=$(node -p "require('./package-lock.json').packages['node_modules/@aikidosec/safe-chain'].version")
+        npm install -g "@aikidosec/safe-chain@${SAFE_VER}"
+        safe-chain setup-ci
 
-        # Install knip and copy default configuration to temporary directory
-        if [ "${{ inputs.dep_scan }}" != "off" ]; then
-          KNIP_VERSION=$(jq -er '.dependencies["knip"]' package.json)
-          npm install -g "knip@$KNIP_VERSION"
-          cp .knip.json "${{ runner.temp }}/.knip.json"
-        fi
+        # Knip
+        KNIP_VER=$(node -p "require('./package-lock.json').packages['node_modules/knip'].version")
+        npm install -g "knip@${KNIP_VER}"
+        mkdir -p "${{ runner.temp }}"
+        cp .knip.json "${{ runner.temp }}/.knip.json"
 
     # Checkout the target repository - SonarCloud requires a full clone
     - uses: actions/checkout@v6
@@ -162,14 +189,14 @@ runs:
 
     # If triggered and (dep or supply) enabled: run analysis tools
     - if: steps.diff.outputs.triggered == 'true' && inputs.dep_scan != 'off'
+      working-directory: ${{ inputs.dir }}
       shell: bash
       run: |
         # Run Knip for dependency and export analysis
         set -e
-        cd "${{ github.workspace }}/${{ inputs.dir }}"
-        
+
         # Clean up any previous Knip output files
-        rm -f knip-output.json knip-error.log knip-summary.txt
+        rm -f knip-output.json knip-summary.txt
 
         # Set config file (suppress hints when using default config)
         if [ -n "${{ inputs.knip_config }}" ]; then
@@ -178,70 +205,187 @@ runs:
           KNIP_CONFIG="--config=${{ runner.temp }}/.knip.json --no-config-hints"
         fi
 
-        # Run knip with JSON output for annotations (stderr separate to avoid corrupting JSON)
+        # Run knip with JSON output for annotations
         set +e
-        knip --dependencies --exports --reporter json ${KNIP_CONFIG} > knip-output.json 2> knip-error.log
+        DOTENV_CONFIG_QUIET=true knip --dependencies --exports --reporter json --no-progress ${KNIP_CONFIG} > knip-output.json
         KNIP_EXIT_CODE=$?
         set -e
 
-        # Validate JSON before parsing (in case of non-JSON errors)
-        if [ "$KNIP_EXIT_CODE" -ne 0 ] && [ -f knip-output.json ]; then
-          if ! jq empty knip-output.json >/dev/null 2>&1; then
-            # Add summary for invalid JSON before exiting
-            {
-              echo "## ❌ Knip Tool Failure (Invalid JSON Output)"
-              echo ""
-              echo "Knip exited with code $KNIP_EXIT_CODE and produced output that is not valid JSON."
-              echo "This indicates a tool failure rather than analysis results."
-              echo ""
-              if [ -f knip-error.log ]; then
-                echo "### Error Output"
-                echo "\`\`\`"
-                cat knip-error.log
-                echo "\`\`\`"
-              fi
-            } >> "$GITHUB_STEP_SUMMARY"
-            
-            echo "::error::Knip failed with exit code $KNIP_EXIT_CODE and did not produce valid JSON"
-            if [ -f knip-error.log ]; then
-              cat knip-error.log
-            fi
-            exit $KNIP_EXIT_CODE
+        # Parse JSON and create annotations using Node.js
+        if [ -f knip-output.json ] && [ -s knip-output.json ]; then
+          # Set directory as environment variable for safe passing to Node.js
+          export KNIP_DIR="${{ inputs.dir }}"
+          
+          # Validate and parse JSON with error handling
+          if ! PARSE_ERROR=$(node -e "
+            try {
+              const fs = require('fs');
+              const content = fs.readFileSync('./knip-output.json', 'utf8');
+              if (!content.trim()) {
+                console.error('ERROR_EMPTY');
+                process.exit(1);
+              }
+              const data = JSON.parse(content);
+              if (!data || typeof data !== 'object') {
+                console.error('ERROR_INVALID');
+                process.exit(1);
+              }
+              console.log('OK');
+            } catch (error) {
+              if (error.code === 'ENOENT') {
+                console.error('ERROR_NOT_FOUND');
+              } else if (error instanceof SyntaxError) {
+                console.error('ERROR_INVALID_JSON: ' + error.message);
+              } else {
+                console.error('ERROR_PARSE: ' + error.message);
+              }
+              process.exit(1);
+            }
+          " 2>&1); then
+          
+            echo "::error::Failed to parse Knip JSON output"
+            case "$PARSE_ERROR" in
+              *ERROR_NOT_FOUND*)
+                echo "::error::knip-output.json file not found. Knip may have failed to generate output."
+                ;;
+              *ERROR_EMPTY*)
+                echo "::error::knip-output.json file is empty. Knip may have produced no output."
+                ;;
+              *ERROR_INVALID_JSON*)
+                echo "::error::Invalid JSON format in knip-output.json. Check if Knip produced error output."
+                echo "::error::$PARSE_ERROR"
+                ;;
+              *)
+                echo "::error::JSON parsing failed: $PARSE_ERROR"
+                ;;
+            esac
+            echo "⚠️  Skipping Knip analysis due to JSON parsing error"
+            exit 0
           fi
-        fi
-
-        # Parse JSON and create annotations
-        if [ -f knip-output.json ] && [ -s knip-output.json ] && jq empty knip-output.json >/dev/null 2>&1; then
-          # Count issues
-          UNUSED_FILES=$(jq -r '.files | length // 0' knip-output.json)
           
-          # Count dependencies and exports across all issues
-          UNUSED_DEPS=$(jq -r '[.issues[].dependencies[]?] | length' knip-output.json)
-          UNUSED_DEV_DEPS=$(jq -r '[.issues[].devDependencies[]?] | length' knip-output.json)
-          UNUSED_EXPORTS=$(jq -r '[.issues[].exports[]?] | length' knip-output.json)
+          # Count issues using Node.js with error handling
+          set +e
+          UNUSED_FILES=$(node -e "
+            try {
+              const data = require('./knip-output.json');
+              console.log((data.files || []).length);
+            } catch (error) {
+              console.error('::error::Failed to parse files from Knip output: ' + error.message);
+              process.exit(1);
+            }
+          " 2>&1)
+          if [ $? -ne 0 ]; then
+            echo "::error::Failed to count unused files"
+            UNUSED_FILES=0
+          fi
           
+          UNUSED_DEPS=$(node -e "
+            try {
+              const data = require('./knip-output.json');
+              console.log((data.issues || []).flatMap(i => i.dependencies || []).length);
+            } catch (error) {
+              console.error('::error::Failed to parse dependencies from Knip output: ' + error.message);
+              process.exit(1);
+            }
+          " 2>&1)
+          if [ $? -ne 0 ]; then
+            echo "::error::Failed to count unused dependencies"
+            UNUSED_DEPS=0
+          fi
+          
+          UNUSED_DEV_DEPS=$(node -e "
+            try {
+              const data = require('./knip-output.json');
+              console.log((data.issues || []).flatMap(i => i.devDependencies || []).length);
+            } catch (error) {
+              console.error('::error::Failed to parse devDependencies from Knip output: ' + error.message);
+              process.exit(1);
+            }
+          " 2>&1)
+          if [ $? -ne 0 ]; then
+            echo "::error::Failed to count unused devDependencies"
+            UNUSED_DEV_DEPS=0
+          fi
+          
+          UNUSED_EXPORTS=$(node -e "
+            try {
+              const data = require('./knip-output.json');
+              console.log((data.issues || []).flatMap(i => i.exports || []).length);
+            } catch (error) {
+              console.error('::error::Failed to parse exports from Knip output: ' + error.message);
+              process.exit(1);
+            }
+          " 2>&1)
+          if [ $? -ne 0 ]; then
+            echo "::error::Failed to count unused exports"
+            UNUSED_EXPORTS=0
+          fi
+          set -e
+            
           if [ "$UNUSED_FILES" -ne 0 ] || [ "$UNUSED_DEPS" -ne 0 ] || [ "$UNUSED_DEV_DEPS" -ne 0 ] || [ "$UNUSED_EXPORTS" -ne 0 ]; then
             
             # Create annotations for unused files
             if [ "$UNUSED_FILES" -ne 0 ]; then
-              jq -r --arg dir "${{ inputs.dir }}" '.files[]? | "::warning file=\($dir + "/" + .),line=1::Unused file"' knip-output.json
+              node -e "
+                try {
+                  const data = require('./knip-output.json');
+                  const dir = process.env.KNIP_DIR;
+                  (data.files || []).forEach(file => console.log(\`::warning file=\${dir}/\${file},line=1::Unused file\`));
+                } catch (error) {
+                  console.error('::error::Failed to create file annotations: ' + error.message);
+                  process.exit(1);
+                }
+              " || echo "::warning::Failed to create annotations for unused files"
             fi
             # Create annotations for unused dependencies
             if [ "$UNUSED_DEPS" -ne 0 ]; then
-              jq -r --arg dir "${{ inputs.dir }}" '.issues[]? | select(.dependencies != null and (.dependencies | length) > 0) | . as $issue | $issue.dependencies[]? | "::warning file=\($dir + "/" + ($issue.file // "package.json")),line=\(.line // 1)::Unused dependency: \(.name)"' knip-output.json
+              node -e "
+                try {
+                  const data = require('./knip-output.json');
+                  const dir = process.env.KNIP_DIR;
+                  (data.issues || []).forEach(issue => {
+                    (issue.dependencies || []).forEach(dep => console.log(\`::warning file=\${dir}/\${issue.file || 'package.json'},line=\${dep.line || 1}::Unused dependency: \${dep.name}\`));
+                  });
+                } catch (error) {
+                  console.error('::error::Failed to create dependency annotations: ' + error.message);
+                  process.exit(1);
+                }
+              " || echo "::warning::Failed to create annotations for unused dependencies"
             fi
             
             # Create annotations for unused devDependencies
             if [ "$UNUSED_DEV_DEPS" -ne 0 ]; then
-              jq -r --arg dir "${{ inputs.dir }}" '.issues[]? | select(.devDependencies != null and (.devDependencies | length) > 0) | . as $issue | $issue.devDependencies[]? | "::warning file=\($dir + "/" + ($issue.file // "package.json")),line=\(.line // 1)::Unused devDependency: \(.name)"' knip-output.json
+              node -e "
+                try {
+                  const data = require('./knip-output.json');
+                  const dir = process.env.KNIP_DIR;
+                  (data.issues || []).forEach(issue => {
+                    (issue.devDependencies || []).forEach(dep => console.log(\`::warning file=\${dir}/\${issue.file || 'package.json'},line=\${dep.line || 1}::Unused devDependency: \${dep.name}\`));
+                  });
+                } catch (error) {
+                  console.error('::error::Failed to create devDependency annotations: ' + error.message);
+                  process.exit(1);
+                }
+              " || echo "::warning::Failed to create annotations for unused devDependencies"
             fi
             
             # Create annotations for unused exports
             if [ "$UNUSED_EXPORTS" -ne 0 ]; then
-              jq -r --arg dir "${{ inputs.dir }}" '.issues[]? | select(.exports != null and (.exports | length) > 0) | . as $issue | $issue.exports[]? | "::notice file=\($dir + "/" + ($issue.file // "package.json")),line=\(.line // 1)::Unused export: \(.name)"' knip-output.json
+              node -e "
+                try {
+                  const data = require('./knip-output.json');
+                  const dir = process.env.KNIP_DIR;
+                  (data.issues || []).forEach(issue => {
+                    (issue.exports || []).forEach(exp => console.log(\`::notice file=\${dir}/\${issue.file || 'package.json'},line=\${exp.line || 1}::Unused export: \${exp.name}\`));
+                  });
+                } catch (error) {
+                  console.error('::error::Failed to create export annotations: ' + error.message);
+                  process.exit(1);
+                }
+              " || echo "::warning::Failed to create annotations for unused exports"
             fi
           fi
-          
+            
           # Run knip with default output for detailed summary (only when issues found)
           # Build config (suppress hints when using default config, same as JSON run)
           if [ -n "${{ inputs.knip_config }}" ]; then
@@ -288,16 +432,10 @@ runs:
         fi
 
         # Handle result
-        # Check if we have valid JSON to distinguish tool failures from analysis results
-        HAS_VALID_JSON=false
-        if [ -f knip-output.json ] && [ -s knip-output.json ] && jq empty knip-output.json >/dev/null 2>&1; then
-          HAS_VALID_JSON=true
-        fi
-        
         if [ $KNIP_EXIT_CODE -eq 0 ]; then
           echo "✅ Knip analysis complete - no unused dependencies or exports found"
-        elif [ "$HAS_VALID_JSON" = "true" ]; then
-          # Valid JSON with non-zero exit = analysis found issues (respect warn/error mode)
+        else
+          # Non-zero exit = analysis found issues (respect warn/error mode)
           echo "⚠️  Knip found issues"
           if [ "${{ inputs.dep_scan }}" = "warn" ]; then
             echo "Running in warn mode - workflow will continue"
@@ -305,27 +443,6 @@ runs:
           else
             echo "Running in error mode - workflow will exit"
             exit $KNIP_EXIT_CODE
-          fi
-        else
-          # No valid JSON with non-zero exit = tool failure (warn but continue)
-          # Add summary for tool failures
-          {
-            echo "## ❌ Knip Tool Failure"
-            echo ""
-            echo "Knip was unable to complete the analysis. This indicates a tool failure, not analysis results."
-            echo ""
-            if [ -f knip-error.log ]; then
-              echo "### Error Output"
-              echo "\`\`\`"
-              cat knip-error.log
-              echo "\`\`\`"
-            fi
-          } >> "$GITHUB_STEP_SUMMARY"
-          
-          echo "::warning::Knip tool failure - unable to complete analysis (workflow will continue)"
-          if [ -f knip-error.log ]; then
-            echo "Error output:"
-            cat knip-error.log
           fi
         fi
 
